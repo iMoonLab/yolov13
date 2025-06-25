@@ -19,6 +19,8 @@
 
 ## Updates
 
+- 2025/06/25: [FastAPI REST API](https://github.com/iMoonLab/yolov13/tree/main/examples/YOLOv13-FastAPI-REST-API) is supported. Thanks to [MohibShaikh](https://github.com/MohibShaikh)!
+
 - 2025/06/24: 🔥 **The paper of YOLOv13 can be downloaded**: [🔗 YOLOv13: Real-Time Object Detection with Hypergraph-Enhanced Adaptive Visual Perception](https://arxiv.org/abs/2506.17733).
 
 - 2025/06/24: [Android deployment](https://github.com/mpj1234/ncnn-yolov13-android/tree/main) is supported. Thanks to [mpj1234](https://github.com/mpj1234)!
