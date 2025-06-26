@@ -1,0 +1,25 @@
+# YOLOv13 Benchmark Suite Requirements
+# Core dependencies for running all benchmark tools
+
+# Main ML/CV frameworks
+ultralytics>=8.0.0
+torch>=1.9.0
+torchvision>=0.10.0
+opencv-python>=4.5.0
+numpy>=1.21.0
+
+# Image processing and visualization
+Pillow>=8.0.0
+matplotlib>=3.3.0
+
+# HTTP requests for downloading test images
+requests>=2.25.0
+
+# Optional: Performance profiling
+psutil>=5.8.0
+
+# Optional: Progress bars
+tqdm>=4.60.0
+
+# Optional: Advanced plotting
+seaborn>=0.11.0 
