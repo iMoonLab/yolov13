@@ -53,8 +53,6 @@ TensorFlow.js:
     $ ln -s ../../yolo11n_web_model public/yolo11n_web_model
     $ npm start
 """
-import sys
-sys.path.append("/data/users/sunwf/code/yolov13")
 import gc
 import json
 import os
