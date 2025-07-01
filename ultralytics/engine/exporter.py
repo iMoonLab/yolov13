@@ -53,7 +53,8 @@ TensorFlow.js:
     $ ln -s ../../yolo11n_web_model public/yolo11n_web_model
     $ npm start
 """
-
+import sys
+sys.path.append("/data/users/sunwf/code/yolov13")
 import gc
 import json
 import os
@@ -122,6 +123,7 @@ def export_formats():
         ["MNN", "mnn", ".mnn", True, True, ["batch", "half", "int8"]],
         ["NCNN", "ncnn", "_ncnn_model", True, True, ["batch", "half"]],
         ["IMX", "imx", "_imx_model", True, True, ["int8"]],
+        ['RKNN', 'rknn', '_rknnopt.torchscript', True, False, ["batch"]],
     ]
     return dict(zip(["Format", "Argument", "Suffix", "CPU", "GPU", "Arguments"], zip(*x)))
 
@@ -241,6 +243,7 @@ class Exporter:
             mnn,
             ncnn,
             imx,
+            rknn,
         ) = flags  # export booleans
         is_tf_format = any((saved_model, pb, tflite, edgetpu, tfjs))
 
@@ -417,6 +420,8 @@ class Exporter:
             f[12], _ = self.export_ncnn()
         if imx:
             f[13], _ = self.export_imx()
+        if rknn:
+            f[12], _ = self.export_rknn()
 
         # Finish
         f = [str(x) for x in f if x]  # filter out '' and None
@@ -481,6 +486,26 @@ class Exporter:
             optimize_for_mobile(ts)._save_for_lite_interpreter(str(f), _extra_files=extra_files)
         else:
             ts.save(str(f), _extra_files=extra_files)
+        return f, None
+
+    @try_export
+    def export_rknn(self, prefix=colorstr('RKNN:')):
+        """YOLOv13 RKNN model export."""
+        LOGGER.info(f'\n{prefix} starting export with torch {torch.__version__}...')
+
+        f = str(self.file).replace(self.file.suffix, f'.onnx')
+        opset_version = self.args.opset or get_latest_opset()
+        torch.onnx.export(
+            self.model,
+            self.im[0:1,:,:,:],
+            f,
+            verbose=False,
+            opset_version=12,
+            do_constant_folding=True,  # WARNING: DNN inference with torch>=1.12 may require do_constant_folding=False
+            input_names=['images'])
+
+        LOGGER.info(f'\n{prefix} feed {f} to RKNN-Toolkit or RKNN-Toolkit2 to generate RKNN model.\n' 
+                    'Refer https://github.com/airockchip/rknn_model_zoo/tree/main/models/CV/object_detection/yolo')
         return f, None
 
     @try_export
@@ -1474,3 +1499,18 @@ class IOSDetectModel(torch.nn.Module):
         """Normalize predictions of object detection model with input size-dependent factors."""
         xywh, cls = self.model(x)[0].transpose(0, 1).split((4, self.nc), 1)
         return cls, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
+
+def export(cfg=DEFAULT_CFG):
+    """Export a YOLOv model to a specific format."""
+    cfg.model = cfg.model or 'yolov8n.yaml'
+    cfg.format = cfg.format or 'torchscript'
+    from ultralytics import YOLO
+    model = YOLO(cfg.model)
+    model.export(**vars(cfg))
+
+if __name__ == '__main__':
+    """
+    CLI:
+    yolo mode=export model=yolov8n.yaml format=onnx
+    """
+    export()

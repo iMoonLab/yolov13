@@ -63,6 +63,16 @@ class Detect(nn.Module):
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
+        if self.export and self.format == 'rknn':
+            y = []
+            for i in range(self.nl):
+                y.append(self.cv2[i](x[i]))
+                cls = torch.sigmoid(self.cv3[i](x[i]))
+                cls_sum = torch.clamp(cls.sum(1, keepdim=True), 0, 1)
+                y.append(cls)
+                y.append(cls_sum)
+            return y   
+
         if self.end2end:
             return self.forward_end2end(x)
 
