@@ -6,6 +6,7 @@ scales: # model compound scaling constants, i.e. 'model=yolov13n.yaml' will call
   l: [1.00, 1.00, 512]    # Large
   x: [1.00, 1.50, 512]    # Extra Large
 
+
 backbone:
   # [from, repeats, module, args]
   - [-1, 1, Conv,  [64, 3, 2]] # 0-P1/2
