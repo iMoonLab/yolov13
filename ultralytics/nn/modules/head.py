@@ -172,6 +172,63 @@ class Detect(nn.Module):
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
 
+class PGMHead(nn.Module):
+    """
+    PGMHead：用 HyperACE 的融合特征，预测一个 3 通道高斯图。
+    输出 shape: (B, 3, H, W)
+    三个通道可以理解为：dx, dy, log_sigma 或者 3 个不同高斯热力图。
+    """
+    def __init__(self, c1, c2=3):
+        """
+        c1: 输入通道数（HyperACE 输出特征的通道）
+        c2: 输出通道数，默认 3
+        """
+        super().__init__()
+        self.c2 = c2
+        self.head = None  # 一开始先不建卷积，等看到真实输入通道再建
+
+    def _build_head(self, in_channels: int):
+        """根据真正的输入通道数 in_channels 动态构建卷积头。"""
+        # 在输出前先做一点“通道降维”，不然从一个很大的 c1 直接卷到 3 通道，中间表达能力可能不够细腻
+        # 把通道压一半（比如 c1=512 → mid=256），这样能：减少参数量；让网络学到一个更紧凑的表示
+        # 防止 c1 本来就很小（比如 24）时，中间通道太少，所以最少给它 16 通道【防止模型变得太瘦，表示能力不够】
+        mid = max(in_channels // 2, 16)  # 中间通道 = in_channels/2，但至少 16
+        # Conv(...)：这是 YOLO 自己封装的卷积块（一般是 Conv2d + BN + 激活）；
+        # nn.Conv2d(...)：原生的 PyTorch 卷积层，不带 BN/激活。
+        # 为什么最后一层不用 YOLO 的 Conv 而用 nn.Conv2d？
+        # 因为最后这 3 个通道是“预测值”，你后面会自己去做：
+        # 激活（比如 sigmoid / tanh / 直接回归）；
+        # loss（L2、NLL、异方差等）；
+        # 这 3 个通道本身是“原始预测量”，不一定需要再加 BN+激活，
+        # 所以直接用裸 conv 比较干净。
+        self.head = nn.Sequential(
+            Conv(in_channels, in_channels, 3),   # 保持分辨率，先卷一圈
+            Conv(in_channels, mid, 3),           # 通道压缩
+            nn.Conv2d(mid, self.c2, 1)           # 输出 3 通道
+        )        
+
+    def forward(self, x):
+        """
+        x: 来自 HyperACE 的输出。
+        有两种可能：
+          - 直接是 (B, C, H, W)
+          - 或者是一个 list/tuple（多尺度），我们取分辨率最高的第 0 个
+        """
+        if isinstance(x, (list, tuple)):
+            feat = x[0]
+        else:
+            feat = x
+        # 这就是把 feat（形状 (B, C1, H, W)）丢进刚刚搭好的三层小网络：
+        # 第一次 forward 的时候，根据 feat 的真实通道数来建 head
+        if self.head is None:
+            in_channels = feat.shape[1]  # 例如 128
+            self._build_head(in_channels)
+
+        out = self.head(feat)  # (B, 3, H, W)
+        
+        # 网络的最终输出就是高斯图
+        return out
+
 class Segment(Detect):
     """YOLO Segment head for segmentation models."""
 
