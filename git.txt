@@ -1,0 +1,5 @@
+git switch test
+git status
+git add .
+git commit -m "XX"
+git push origin test
