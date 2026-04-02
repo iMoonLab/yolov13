@@ -331,7 +331,7 @@ def _sample_label_files(train_paths, max_files=200):
             except Exception:
                 im_files = []
             for im in im_files:
-                lb = Path(str(im).replace(f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}")).with_suffix(".txt")
+                lb = Path(img2label_paths([str(im)])[0])
                 if lb.exists():
                     s = str(lb)
                     if s not in seen:
