@@ -298,7 +298,146 @@ def find_dataset_yaml(path: Path) -> Path:
     return files[0]
 
 
-def check_det_dataset(dataset, autodownload=True):
+def _sample_label_files(train_paths, max_files=200):
+    """Collect a sample of label files from train image paths."""
+    label_files = []
+    seen = set()
+
+    def _add_from_dir(d: Path):
+        if not d.exists() or not d.is_dir():
+            return False
+        added = False
+        for lb in d.rglob("*.txt"):
+            s = str(lb)
+            if s not in seen:
+                seen.add(s)
+                label_files.append(lb)
+                added = True
+                if len(label_files) >= max_files:
+                    return True
+        return added
+
+    for p in train_paths:
+        p = Path(p)
+        if not p.exists():
+            continue
+
+        # train path can be a text file with image paths
+        if p.is_file() and p.suffix.lower() == ".txt":
+            try:
+                im_files = [
+                    Path(x.strip()) for x in p.read_text(encoding="utf-8", errors="ignore").splitlines() if x.strip()
+                ]
+            except Exception:
+                im_files = []
+            for im in im_files:
+                lb = Path(str(im).replace(f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}")).with_suffix(".txt")
+                if lb.exists():
+                    s = str(lb)
+                    if s not in seen:
+                        seen.add(s)
+                        label_files.append(lb)
+                        if len(label_files) >= max_files:
+                            return label_files
+            continue
+
+        if p.is_file():
+            continue
+
+        candidates = [
+            Path(str(p).replace(f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}")),
+            p.parent / "labels",
+            p.parent.parent / "labels" / p.name,
+            p / "labels",
+        ]
+        for c in candidates:
+            if _add_from_dir(c) and len(label_files) >= max_files:
+                return label_files
+
+        # Fallback: scan nearby roots for any labels subtree
+        for root in {p, p.parent, p.parent.parent}:
+            if not root.exists() or not root.is_dir():
+                continue
+            for labels_dir in root.rglob("labels"):
+                if _add_from_dir(labels_dir) and len(label_files) >= max_files:
+                    return label_files
+
+    return label_files
+
+
+def _validate_task_label_schema(data, task):
+    """Validate task-specific label line shape for a sample of train labels."""
+    if task not in {"segment", "pose", "obb"}:
+        return
+
+    train = data.get("train")
+    train_paths = train if isinstance(train, (list, tuple)) else [train]
+    label_files = _sample_label_files(train_paths)
+    if not label_files:
+        LOGGER.warning(f"WARNING ⚠️ task={task} preflight skipped: no label files sampled from train paths.")
+        return
+
+    if task == "pose":
+        kpt_shape = data.get("kpt_shape")
+        if not isinstance(kpt_shape, (list, tuple)) or len(kpt_shape) != 2:
+            raise SyntaxError(emojis(f"Pose dataset requires 'kpt_shape: [num_kpts, dims]' in data YAML. {HELP_URL}"))
+        nkpt, ndim = int(kpt_shape[0]), int(kpt_shape[1])
+        if nkpt <= 0 or ndim not in {2, 3}:
+            raise SyntaxError(
+                emojis(f"Invalid kpt_shape={kpt_shape}. Expected [num_kpts>0, dims in {{2,3}}]. {HELP_URL}")
+            )
+        expected = 5 + nkpt * ndim
+    else:
+        expected = None
+
+    errors = []
+    checked = 0
+    for lb in label_files:
+        try:
+            lines = lb.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+
+        for i, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            checked += 1
+            n = len(parts)
+
+            try:
+                _ = [float(x) for x in parts]
+            except ValueError:
+                errors.append(f"{lb}:{i} contains non-numeric values")
+                if len(errors) >= 5:
+                    break
+                continue
+
+            if task == "pose":
+                if n != expected:
+                    errors.append(f"{lb}:{i} has {n} columns, expected {expected} for pose")
+            elif task == "segment":
+                if n < 7 or n % 2 == 0:
+                    errors.append(f"{lb}:{i} has {n} columns, expected cls + polygon coords (odd >= 7)")
+            elif task == "obb":
+                if n < 9 or n % 2 == 0:
+                    errors.append(f"{lb}:{i} has {n} columns, expected cls + 8+ corner coords (odd >= 9)")
+
+            if len(errors) >= 5:
+                break
+        if len(errors) >= 5:
+            break
+
+    if errors:
+        hint = "\n".join(errors)
+        raise SyntaxError(emojis(f"Task preflight failed for task={task} ❌\n{hint}\n{HELP_URL}"))
+
+    if checked == 0:
+        LOGGER.warning(f"WARNING ⚠️ task={task} preflight sampled labels but found no non-empty label rows.")
+
+
+def check_det_dataset(dataset, autodownload=True, task=None):
     """
     Download, verify, and/or unzip a dataset if not found locally.
 
@@ -387,6 +526,9 @@ def check_det_dataset(dataset, autodownload=True):
             s = f"success ✅ {dt}, saved to {colorstr('bold', DATASETS_DIR)}" if r in {0, None} else f"failure {dt} ❌"
             LOGGER.info(f"Dataset download {s}\n")
     check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf")  # download fonts
+
+    if task in {"segment", "pose", "obb"}:
+        _validate_task_label_schema(data, task)
 
     return data  # dictionary
 

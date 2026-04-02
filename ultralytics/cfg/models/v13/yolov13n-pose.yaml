@@ -1,0 +1,50 @@
+nc: 80 # number of classes
+kpt_shape: [17, 3] # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+scales: # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]   # Nano
+  s: [0.50, 0.50, 1024]   # Small
+  l: [1.00, 1.00, 512]    # Large
+  x: [1.00, 1.50, 512]    # Extra Large
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv,  [64, 3, 2]]
+  - [-1, 1, Conv,  [128, 3, 2, 1, 2]]
+  - [-1, 2, DSC3k2,  [256, False, 0.25]]
+  - [-1, 1, Conv,  [256, 3, 2, 1, 4]]
+  - [-1, 2, DSC3k2,  [512, False, 0.25]]
+  - [-1, 1, DSConv,  [512, 3, 2]]
+  - [-1, 4, A2C2f, [512, True, 4]]
+  - [-1, 1, DSConv,  [1024, 3, 2]]
+  - [-1, 4, A2C2f, [1024, True, 1]]
+
+head:
+  - [[4, 6, 8], 2, HyperACE, [512, 8, True, True, 0.5, 1, "both"]]
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [ 9, 1, DownsampleConv, []]
+  - [[6, 9], 1, FullPAD_Tunnel, []]
+  - [[4, 10], 1, FullPAD_Tunnel, []]
+  - [[8, 11], 1, FullPAD_Tunnel, []]
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 2, DSC3k2, [512, True]]
+  - [[-1, 9], 1, FullPAD_Tunnel, []]
+
+  - [17, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 2, DSC3k2, [256, True]]
+  - [10, 1, Conv, [256, 1, 1]]
+  - [[21, 22], 1, FullPAD_Tunnel, []]
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 18], 1, Concat, [1]]
+  - [-1, 2, DSC3k2, [512, True]]
+  - [[-1, 9], 1, FullPAD_Tunnel, []]
+
+  - [26, 1, Conv, [512, 3, 2]]
+  - [[-1, 14], 1, Concat, [1]]
+  - [-1, 2, DSC3k2, [1024, True]]
+  - [[-1, 11], 1, FullPAD_Tunnel, []]
+
+  - [[23, 27, 31], 1, Pose, [nc, kpt_shape]]

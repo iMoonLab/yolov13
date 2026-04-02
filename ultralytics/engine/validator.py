@@ -142,7 +142,7 @@ class BaseValidator:
                 LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
 
             if str(self.args.data).split(".")[-1] in {"yaml", "yml"}:
-                self.data = check_det_dataset(self.args.data)
+                self.data = check_det_dataset(self.args.data, task=self.args.task)
             elif self.args.task == "classify":
                 self.data = check_cls_dataset(self.args.data, split=self.args.split)
             else:

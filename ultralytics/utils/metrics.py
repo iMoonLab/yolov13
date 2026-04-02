@@ -741,7 +741,7 @@ class Metric(SimpleClass):
 
     def mean_results(self):
         """Mean of results, return mp, mr, map50, map."""
-        return [self.mp, self.mr, self.map50, self.map75,self.map]
+        return [self.mp, self.mr, self.map50, self.map75, self.map]
 
     def class_result(self, i):
         """Class-aware result, return p[i], r[i], ap50[i], ap[i]."""
@@ -865,7 +865,13 @@ class DetMetrics(SimpleClass):
     @property
     def keys(self):
         """Returns a list of keys for accessing specific metrics."""
-        return ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP75(B)", "metrics/mAP50-95(B)"]
+        return [
+            "metrics/precision(B)",
+            "metrics/recall(B)",
+            "metrics/mAP50(B)",
+            "metrics/mAP75(B)",
+            "metrics/mAP50-95(B)",
+        ]
 
     def mean_results(self):
         """Calculate mean of detected objects & return precision, recall, mAP50, and mAP50-95."""
@@ -1267,14 +1273,20 @@ class OBBMetrics(SimpleClass):
     @property
     def keys(self):
         """Returns a list of keys for accessing specific metrics."""
-        return ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]
+        return [
+            "metrics/precision(B)",
+            "metrics/recall(B)",
+            "metrics/mAP50(B)",
+            "metrics/mAP75(B)",
+            "metrics/mAP50-95(B)",
+        ]
 
     def mean_results(self):
-        """Calculate mean of detected objects & return precision, recall, mAP50, and mAP50-95."""
+        """Calculate mean results and return precision, recall, mAP50, mAP75, and mAP50-95."""
         return self.box.mean_results()
 
     def class_result(self, i):
-        """Return the result of evaluating the performance of an object detection model on a specific class."""
+        """Return per-class precision, recall, AP50, AP75, and AP50-95."""
         return self.box.class_result(i)
 
     @property

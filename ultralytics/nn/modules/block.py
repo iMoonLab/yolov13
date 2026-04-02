@@ -50,10 +50,10 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
-    "HyperACE", 
-    "DownsampleConv", 
+    "HyperACE",
+    "DownsampleConv",
     "FullPAD_Tunnel",
-    "DSC3k2"
+    "DSC3k2",
 )
 
 
@@ -1161,21 +1161,80 @@ class TorchVision(nn.Module):
             y = self.m(x)
         return y
 
+
 import logging
+import os
+
 logger = logging.getLogger(__name__)
 
 USE_FLASH_ATTN = False
-try:
-    import torch
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:  # Ampere or newer
-        from flash_attn.flash_attn_interface import flash_attn_func
-        USE_FLASH_ATTN = True
-    else:
-        from torch.nn.functional import scaled_dot_product_attention as sdpa
-        logger.warning("FlashAttention is not available on this device. Using scaled_dot_product_attention instead.")
-except Exception:
-    from torch.nn.functional import scaled_dot_product_attention as sdpa
-    logger.warning("FlashAttention is not available on this device. Using scaled_dot_product_attention instead.")
+FLASH_BACKEND = "fallback"
+FLASH_ERROR = ""
+
+
+def configure_flash_backend(disable_flash=None, use_turing_flash=None):
+    """Configure flash attention backend from flags or environment."""
+    global USE_FLASH_ATTN, FLASH_BACKEND, FLASH_ERROR
+
+    USE_FLASH_ATTN = False
+    FLASH_BACKEND = "fallback"
+    FLASH_ERROR = ""
+
+    try:
+        import torch
+
+        disable_flash = (os.getenv("Y13_DISABLE_FLASH", "0") == "1") if disable_flash is None else bool(disable_flash)
+        use_turing_flash = (
+            (os.getenv("Y13_USE_TURING_FLASH", "0") == "1") if use_turing_flash is None else bool(use_turing_flash)
+        )
+
+        if torch.cuda.is_available() and not disable_flash:
+            major, minor = torch.cuda.get_device_capability()
+
+            if major >= 8:
+                try:
+                    from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
+
+                    globals()["flash_attn_func"] = _flash_attn_func
+                    USE_FLASH_ATTN = True
+                    FLASH_BACKEND = "flash_attn"
+                except Exception as e:
+                    FLASH_ERROR = str(e)
+
+            elif (major, minor) == (7, 5) and use_turing_flash:
+                try:
+                    from ultralytics.utils.flash_turing_interface import flash_attn_func as _flash_attn_func
+
+                    globals()["flash_attn_func"] = _flash_attn_func
+                    USE_FLASH_ATTN = True
+                    FLASH_BACKEND = "flash_attn_turing"
+                except Exception as e:
+                    FLASH_ERROR = str(e)
+
+        if not USE_FLASH_ATTN:
+            if disable_flash:
+                logger.info("Flash attention disabled by Y13_DISABLE_FLASH=1, using fallback attention backend.")
+            elif FLASH_ERROR:
+                logger.warning(
+                    f"Flash attention backend unavailable ({FLASH_ERROR}). Using fallback attention backend."
+                )
+            else:
+                logger.warning(
+                    "Flash attention backend unavailable on this device/config. Using fallback attention backend."
+                )
+        else:
+            logger.info(f"Flash backend selected: {FLASH_BACKEND}")
+    except Exception as e:
+        FLASH_ERROR = str(e)
+        USE_FLASH_ATTN = False
+        FLASH_BACKEND = "fallback"
+        logger.warning(f"Flash attention initialization failed ({FLASH_ERROR}). Using fallback attention backend.")
+
+    return FLASH_BACKEND
+
+
+configure_flash_backend()
+
 
 class AAttn(nn.Module):
     """
@@ -1196,8 +1255,8 @@ class AAttn(nn.Module):
         >>> x = torch.randn(2, 64, 128, 128)
         >>> output = model(x)
         >>> print(output.shape)
-    
-    Notes: 
+
+    Notes:
         recommend that dim//num_heads be a multiple of 32 or 64.
 
     """
@@ -1217,7 +1276,6 @@ class AAttn(nn.Module):
 
         self.pe = Conv(all_head_dim, dim, 5, 1, 2, g=dim, act=False)
 
-
     def forward(self, x):
         """Processes the input tensor 'x' through the area-attention"""
         B, C, H, W = x.shape
@@ -1225,8 +1283,8 @@ class AAttn(nn.Module):
 
         qk = self.qk(x).flatten(2).transpose(1, 2)
         v = self.v(x)
-        pp = self.pe(v)
-        v = v.flatten(2).transpose(1, 2)
+        pp = self.pe(v).contiguous()
+        v = v.flatten(2).transpose(1, 2).contiguous()
 
         if self.area > 1:
             qk = qk.reshape(B * self.area, N // self.area, C * 2)
@@ -1234,36 +1292,32 @@ class AAttn(nn.Module):
             B, N, _ = qk.shape
         q, k = qk.split([C, C], dim=2)
 
-        if x.is_cuda and USE_FLASH_ATTN:
+        if x.is_cuda and USE_FLASH_ATTN and self.head_dim in {64, 128}:
             q = q.view(B, N, self.num_heads, self.head_dim)
             k = k.view(B, N, self.num_heads, self.head_dim)
             v = v.view(B, N, self.num_heads, self.head_dim)
 
-            x = flash_attn_func(
-                q.contiguous().half(),
-                k.contiguous().half(),
-                v.contiguous().half()
-            ).to(q.dtype)
+            x = flash_attn_func(q.contiguous().half(), k.contiguous().half(), v.contiguous().half()).to(q.dtype)
         else:
-            q = q.transpose(1, 2).view(B, self.num_heads, self.head_dim, N)
-            k = k.transpose(1, 2).view(B, self.num_heads, self.head_dim, N)
-            v = v.transpose(1, 2).view(B, self.num_heads, self.head_dim, N)
+            q = q.transpose(1, 2).reshape(B, self.num_heads, self.head_dim, N).contiguous()
+            k = k.transpose(1, 2).reshape(B, self.num_heads, self.head_dim, N).contiguous()
+            v = v.transpose(1, 2).reshape(B, self.num_heads, self.head_dim, N).contiguous()
 
-            attn = (q.transpose(-2, -1) @ k) * (self.head_dim ** -0.5)
+            attn = (q.transpose(-2, -1) @ k) * (self.head_dim**-0.5)
             max_attn = attn.max(dim=-1, keepdim=True).values
             exp_attn = torch.exp(attn - max_attn)
             attn = exp_attn / exp_attn.sum(dim=-1, keepdim=True)
-            x = (v @ attn.transpose(-2, -1))
+            x = v @ attn.transpose(-2, -1)
 
-            x = x.permute(0, 3, 1, 2)
+            x = x.permute(0, 3, 1, 2).contiguous()
 
         if self.area > 1:
             x = x.reshape(B // self.area, N * self.area, C)
             B, N, _ = x.shape
-        x = x.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        x = x.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
         return self.proj(x + pp)
-    
+
 
 class ABlock(nn.Module):
     """
@@ -1287,8 +1341,8 @@ class ABlock(nn.Module):
         >>> x = torch.randn(2, 64, 128, 128)
         >>> output = model(x)
         >>> print(output.shape)
-    
-    Notes: 
+
+    Notes:
         recommend that dim//num_heads be a multiple of 32 or 64.
     """
 
@@ -1316,7 +1370,7 @@ class ABlock(nn.Module):
         return x
 
 
-class A2C2f(nn.Module):  
+class A2C2f(nn.Module):
     """
     A2C2f module with residual enhanced feature extraction using ABlock blocks with area-attention. Also known as R-ELAN
 
@@ -1361,7 +1415,10 @@ class A2C2f(nn.Module):
         self.gamma = nn.Parameter(init_values * torch.ones((c2)), requires_grad=True) if a2 and residual else None
 
         self.m = nn.ModuleList(
-            nn.Sequential(*(ABlock(c_, num_heads, mlp_ratio, area) for _ in range(2))) if a2 else C3k(c_, c_, 2, shortcut, g) for _ in range(n)
+            nn.Sequential(*(ABlock(c_, num_heads, mlp_ratio, area) for _ in range(2)))
+            if a2
+            else C3k(c_, c_, 2, shortcut, g)
+            for _ in range(n)
         )
 
     def forward(self, x):
@@ -1372,12 +1429,13 @@ class A2C2f(nn.Module):
             return x + self.gamma.view(1, -1, 1, 1) * self.cv2(torch.cat(y, 1))
         return self.cv2(torch.cat(y, 1))
 
+
 class DSBottleneck(nn.Module):
     """
     An improved bottleneck block using depthwise separable convolutions (DSConv).
 
     This class implements a lightweight bottleneck module that replaces standard convolutions with depthwise
-    separable convolutions to reduce parameters and computational cost. 
+    separable convolutions to reduce parameters and computational cost.
 
     Attributes:
         c1 (int): Number of input channels.
@@ -1399,11 +1457,12 @@ class DSBottleneck(nn.Module):
         >>> print(output.shape)
         torch.Size([2, 64, 32, 32])
     """
+
     def __init__(self, c1, c2, shortcut=True, e=0.5, k1=3, k2=5, d2=1):
         super().__init__()
         c_ = int(c2 * e)
-        self.cv1 = DSConv(c1, c_, k1, s=1, p=None, d=1)   
-        self.cv2 = DSConv(c_, c2, k2, s=1, p=None, d=d2)  
+        self.cv1 = DSConv(c1, c_, k1, s=1, p=None, d=1)
+        self.cv2 = DSConv(c_, c2, k2, s=1, p=None, d=d2)
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
@@ -1440,34 +1499,13 @@ class DSC3k(C3):
         >>> print(output.shape)
         torch.Size([2, 128, 64, 64])
     """
-    def __init__(
-        self,
-        c1,                
-        c2,                 
-        n=1,                
-        shortcut=True,      
-        g=1,                 
-        e=0.5,              
-        k1=3,               
-        k2=5,               
-        d2=1                 
-    ):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        c_ = int(c2 * e)  
 
-        self.m = nn.Sequential(
-            *(
-                DSBottleneck(
-                    c_, c_,
-                    shortcut=shortcut,
-                    e=1.0,
-                    k1=k1,
-                    k2=k2,
-                    d2=d2
-                )
-                for _ in range(n)
-            )
-        )
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k1=3, k2=5, d2=1):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+
+        self.m = nn.Sequential(*(DSBottleneck(c_, c_, shortcut=shortcut, e=1.0, k1=k1, k2=k2, d2=d2) for _ in range(n)))
+
 
 class DSC3k2(C2f):
     """
@@ -1505,46 +1543,18 @@ class DSC3k2(C2f):
         >>> print(f"With DSC3k: {output2.shape}")
         With DSC3k: torch.Size([2, 64, 128, 128])
     """
-    def __init__(
-        self,
-        c1,          
-        c2,         
-        n=1,          
-        dsc3k=False,  
-        e=0.5,       
-        g=1,        
-        shortcut=True,
-        k1=3,       
-        k2=7,       
-        d2=1         
-    ):
+
+    def __init__(self, c1, c2, n=1, dsc3k=False, e=0.5, g=1, shortcut=True, k1=3, k2=7, d2=1):
         super().__init__(c1, c2, n, shortcut, g, e)
         if dsc3k:
             self.m = nn.ModuleList(
-                DSC3k(
-                    self.c, self.c,
-                    n=2,           
-                    shortcut=shortcut,
-                    g=g,
-                    e=1.0,  
-                    k1=k1,
-                    k2=k2,
-                    d2=d2
-                )
-                for _ in range(n)
+                DSC3k(self.c, self.c, n=2, shortcut=shortcut, g=g, e=1.0, k1=k1, k2=k2, d2=d2) for _ in range(n)
             )
         else:
             self.m = nn.ModuleList(
-                DSBottleneck(
-                    self.c, self.c,
-                    shortcut=shortcut,
-                    e=1.0,
-                    k1=k1,
-                    k2=k2,
-                    d2=d2
-                )
-                for _ in range(n)
+                DSBottleneck(self.c, self.c, shortcut=shortcut, e=1.0, k1=k1, k2=k2, d2=d2) for _ in range(n)
             )
+
 
 class AdaHyperedgeGen(nn.Module):
     """
@@ -1572,6 +1582,7 @@ class AdaHyperedgeGen(nn.Module):
         >>> print(A.shape)
         torch.Size([2, 100, 16])
     """
+
     def __init__(self, node_dim, num_hyperedges, num_heads=4, dropout=0.1, context="both"):
         super().__init__()
         self.num_heads = num_heads
@@ -1582,46 +1593,44 @@ class AdaHyperedgeGen(nn.Module):
         self.prototype_base = nn.Parameter(torch.Tensor(num_hyperedges, node_dim))
         nn.init.xavier_uniform_(self.prototype_base)
         if context in ("mean", "max"):
-            self.context_net = nn.Linear(node_dim, num_hyperedges * node_dim)  
+            self.context_net = nn.Linear(node_dim, num_hyperedges * node_dim)
         elif context == "both":
-            self.context_net = nn.Linear(2*node_dim, num_hyperedges * node_dim)
+            self.context_net = nn.Linear(2 * node_dim, num_hyperedges * node_dim)
         else:
-            raise ValueError(
-                f"Unsupported context '{context}'. "
-                "Expected one of: 'mean', 'max', 'both'."
-            )
+            raise ValueError(f"Unsupported context '{context}'. Expected one of: 'mean', 'max', 'both'.")
 
         self.pre_head_proj = nn.Linear(node_dim, node_dim)
-    
+
         self.dropout = nn.Dropout(dropout)
         self.scaling = math.sqrt(self.head_dim)
 
     def forward(self, X):
         B, N, D = X.shape
         if self.context == "mean":
-            context_cat = X.mean(dim=1)          
+            context_cat = X.mean(dim=1)
         elif self.context == "max":
-            context_cat, _ = X.max(dim=1)          
+            context_cat, _ = X.max(dim=1)
         else:
-            avg_context = X.mean(dim=1)           
-            max_context, _ = X.max(dim=1)           
-            context_cat = torch.cat([avg_context, max_context], dim=-1) 
-        prototype_offsets = self.context_net(context_cat).view(B, self.num_hyperedges, D)  
-        prototypes = self.prototype_base.unsqueeze(0) + prototype_offsets           
-        
-        X_proj = self.pre_head_proj(X) 
+            avg_context = X.mean(dim=1)
+            max_context, _ = X.max(dim=1)
+            context_cat = torch.cat([avg_context, max_context], dim=-1)
+        prototype_offsets = self.context_net(context_cat).view(B, self.num_hyperedges, D)
+        prototypes = self.prototype_base.unsqueeze(0) + prototype_offsets
+
+        X_proj = self.pre_head_proj(X)
         X_heads = X_proj.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         proto_heads = prototypes.view(B, self.num_hyperedges, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        
+
         X_heads_flat = X_heads.reshape(B * self.num_heads, N, self.head_dim)
         proto_heads_flat = proto_heads.reshape(B * self.num_heads, self.num_hyperedges, self.head_dim).transpose(1, 2)
-        
-        logits = torch.bmm(X_heads_flat, proto_heads_flat) / self.scaling 
-        logits = logits.view(B, self.num_heads, N, self.num_hyperedges).mean(dim=1) 
-        
-        logits = self.dropout(logits)  
+
+        logits = torch.bmm(X_heads_flat, proto_heads_flat) / self.scaling
+        logits = logits.view(B, self.num_heads, N, self.num_hyperedges).mean(dim=1)
+
+        logits = self.dropout(logits)
 
         return F.softmax(logits, dim=1)
+
 
 class AdaHGConv(nn.Module):
     """
@@ -1646,34 +1655,30 @@ class AdaHGConv(nn.Module):
     Examples:
         >>> import torch
         >>> model = AdaHGConv(embed_dim=128, num_hyperedges=16, num_heads=8)
-        >>> x = torch.randn(2, 256, 128) # (Batch, Num_Nodes, Dim)
+        >>> x = torch.randn(2, 256, 128)  # (Batch, Num_Nodes, Dim)
         >>> output = model(x)
         >>> print(output.shape)
         torch.Size([2, 256, 128])
     """
+
     def __init__(self, embed_dim, num_hyperedges=16, num_heads=4, dropout=0.1, context="both"):
         super().__init__()
         self.edge_generator = AdaHyperedgeGen(embed_dim, num_hyperedges, num_heads, dropout, context)
-        self.edge_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim ),
-            nn.GELU()
-        )
-        self.node_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim ),
-            nn.GELU()
-        )
-        
+        self.edge_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.GELU())
+        self.node_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.GELU())
+
     def forward(self, X):
-        A = self.edge_generator(X)  
-        
-        He = torch.bmm(A.transpose(1, 2), X) 
+        A = self.edge_generator(X)
+
+        He = torch.bmm(A.transpose(1, 2), X)
         He = self.edge_proj(He)
-        
-        X_new = torch.bmm(A, He)  
+
+        X_new = torch.bmm(A, He)
         X_new = self.node_proj(X_new)
-        
+
         return X_new + X
-        
+
+
 class AdaHGComputation(nn.Module):
     """
     A wrapper module for applying adaptive hypergraph convolution to 4D feature maps.
@@ -1695,28 +1700,26 @@ class AdaHGComputation(nn.Module):
     Examples:
         >>> import torch
         >>> model = AdaHGComputation(embed_dim=64, num_hyperedges=8, num_heads=4)
-        >>> x = torch.randn(2, 64, 32, 32) # (B, C, H, W)
+        >>> x = torch.randn(2, 64, 32, 32)  # (B, C, H, W)
         >>> output = model(x)
         >>> print(output.shape)
         torch.Size([2, 64, 32, 32])
     """
+
     def __init__(self, embed_dim, num_hyperedges=16, num_heads=8, dropout=0.1, context="both"):
         super().__init__()
         self.embed_dim = embed_dim
         self.hgnn = AdaHGConv(
-            embed_dim=embed_dim,
-            num_hyperedges=num_hyperedges,
-            num_heads=num_heads,
-            dropout=dropout,
-            context=context
+            embed_dim=embed_dim, num_hyperedges=num_hyperedges, num_heads=num_heads, dropout=dropout, context=context
         )
-        
+
     def forward(self, x):
         B, C, H, W = x.shape
-        tokens = x.flatten(2).transpose(1, 2) 
-        tokens = self.hgnn(tokens) 
+        tokens = x.flatten(2).transpose(1, 2)
+        tokens = self.hgnn(tokens)
         x_out = tokens.transpose(1, 2).view(B, C, H, W)
-        return x_out 
+        return x_out
+
 
 class C3AH(nn.Module):
     """
@@ -1744,22 +1747,22 @@ class C3AH(nn.Module):
         >>> print(output.shape)
         torch.Size([2, 128, 32, 32])
     """
+
     def __init__(self, c1, c2, e=1.0, num_hyperedges=8, context="both"):
         super().__init__()
-        c_ = int(c2 * e)  
+        c_ = int(c2 * e)
         assert c_ % 16 == 0, "Dimension of AdaHGComputation should be a multiple of 16."
         num_heads = c_ // 16
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
-        self.m = AdaHGComputation(embed_dim=c_, 
-                          num_hyperedges=num_hyperedges, 
-                          num_heads=num_heads,
-                          dropout=0.1,
-                          context=context)
-        self.cv3 = Conv(2 * c_, c2, 1)  
-        
+        self.m = AdaHGComputation(
+            embed_dim=c_, num_hyperedges=num_hyperedges, num_heads=num_heads, dropout=0.1, context=context
+        )
+        self.cv3 = Conv(2 * c_, c2, 1)
+
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+
 
 class FuseModule(nn.Module):
     """
@@ -1785,10 +1788,11 @@ class FuseModule(nn.Module):
         >>> print(output.shape)
         torch.Size([2, 64, 32, 32])
     """
+
     def __init__(self, c_in, channel_adjust):
         super(FuseModule, self).__init__()
         self.downsample = nn.AvgPool2d(kernel_size=2)
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
         if channel_adjust:
             self.conv_out = Conv(4 * c_in, c_in, 1)
         else:
@@ -1800,6 +1804,7 @@ class FuseModule(nn.Module):
         x_cat = torch.cat([x1_ds, x[1], x3_up], dim=1)
         out = self.conv_out(x_cat)
         return out
+
 
 class HyperACE(nn.Module):
     """
@@ -1833,18 +1838,32 @@ class HyperACE(nn.Module):
         >>> print(output.shape)
         torch.Size([2, 256, 32, 32])
     """
-    def __init__(self, c1, c2, n=1, num_hyperedges=8, dsc3k=True, shortcut=False, e1=0.5, e2=1, context="both", channel_adjust=True):
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        num_hyperedges=8,
+        dsc3k=True,
+        shortcut=False,
+        e1=0.5,
+        e2=1,
+        context="both",
+        channel_adjust=True,
+    ):
         super().__init__()
-        self.c = int(c2 * e1) 
+        self.c = int(c2 * e1)
         self.cv1 = Conv(c1, 3 * self.c, 1, 1)
-        self.cv2 = Conv((4 + n) * self.c, c2, 1) 
+        self.cv2 = Conv((4 + n) * self.c, c2, 1)
         self.m = nn.ModuleList(
-            DSC3k(self.c, self.c, 2, shortcut, k1=3, k2=7) if dsc3k else DSBottleneck(self.c, self.c, shortcut=shortcut) for _ in range(n)
+            DSC3k(self.c, self.c, 2, shortcut, k1=3, k2=7) if dsc3k else DSBottleneck(self.c, self.c, shortcut=shortcut)
+            for _ in range(n)
         )
         self.fuse = FuseModule(c1, channel_adjust)
         self.branch1 = C3AH(self.c, self.c, e2, num_hyperedges, context)
         self.branch2 = C3AH(self.c, self.c, e2, num_hyperedges, context)
-                    
+
     def forward(self, X):
         x = self.fuse(X)
         y = list(self.cv1(x).chunk(3, 1))
@@ -1854,6 +1873,7 @@ class HyperACE(nn.Module):
         y[1] = out1
         y.append(out2)
         return self.cv2(torch.cat(y, 1))
+
 
 class DownsampleConv(nn.Module):
     """
@@ -1877,16 +1897,18 @@ class DownsampleConv(nn.Module):
         >>> print(output.shape)
         torch.Size([2, 128, 16, 16])
     """
+
     def __init__(self, in_channels, channel_adjust=True):
         super().__init__()
         self.downsample = nn.AvgPool2d(kernel_size=2)
         if channel_adjust:
             self.channel_adjust = Conv(in_channels, in_channels * 2, 1)
         else:
-            self.channel_adjust = nn.Identity() 
+            self.channel_adjust = nn.Identity()
 
     def forward(self, x):
         return self.channel_adjust(self.downsample(x))
+
 
 class FullPAD_Tunnel(nn.Module):
     """
@@ -1908,9 +1930,11 @@ class FullPAD_Tunnel(nn.Module):
         >>> print(output.shape)
         torch.Size([2, 64, 32, 32])
     """
+
     def __init__(self):
         super().__init__()
         self.gate = nn.Parameter(torch.tensor(0.0))
+
     def forward(self, x):
         out = x[0] + self.gate * x[1]
         return out
