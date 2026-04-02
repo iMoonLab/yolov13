@@ -264,13 +264,19 @@ class BaseTrainer:
             self.amp = torch.tensor(check_amp(self.model), device=self.device)
             callbacks.default_callbacks = callbacks_backup  # restore callbacks
         if RANK > -1 and world_size > 1:  # DDP
-            dist.broadcast(self.amp, src=0)  # broadcast the tensor from rank 0 to all other ranks (returns None)
+            self.amp = self.amp.int()  # gloo backend may fail on bool tensor broadcast in some torch builds
+            dist.broadcast(self.amp, src=0)
         self.amp = bool(self.amp)  # as boolean
         self.scaler = (
             torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
         )
         if world_size > 1:
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[RANK],
+                find_unused_parameters=True,
+                gradient_as_bucket_view=False,
+            )
             self.set_model_attributes()  # set again after DDP wrapper
 
         # Check imgsz
@@ -384,6 +390,19 @@ class BaseTrainer:
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
+
+                # Non-finite loss guard for DDP stability
+                loss_is_finite = torch.isfinite(self.loss.detach()).int()
+                if RANK != -1:
+                    dist.all_reduce(loss_is_finite, op=dist.ReduceOp.MIN)
+                if not bool(loss_is_finite.item()):
+                    if RANK in {-1, 0}:
+                        loss_value = float(self.loss.detach().float().cpu())
+                        LOGGER.warning(
+                            "WARNING ⚠️ Non-finite loss detected (%.4g). Skipping optimizer step." % loss_value
+                        )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
@@ -560,7 +579,7 @@ class BaseTrainer:
                 "pose",
                 "obb",
             }:
-                data = check_det_dataset(self.args.data)
+                data = check_det_dataset(self.args.data, task=self.args.task)
                 if "yaml_file" in data:
                     self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
         except Exception as e:
